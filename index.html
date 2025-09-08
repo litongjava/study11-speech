@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>English STT + Recorder (Chrome)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0f172a,#1f2937);color:var(--fg);}
+    .wrap{max-width:1000px;margin:48px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid #1f2937;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);overflow:hidden}
+    header{padding:20px;border-bottom:1px solid #1f2937;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+    .title{font-size:20px;font-weight:700}
+    .status{font-size:14px;color:var(--muted)}
+    .controls{display:flex;gap:10px;flex-wrap:wrap}
+    button{cursor:pointer;border:0;border-radius:12px;padding:10px 14px;font-weight:600;color:white;background:var(--accent)}
+    button.secondary{background:#374151}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    main{display:grid;grid-template-columns:1fr 360px;gap:12px;padding:12px}
+    @media (max-width:980px){ main{grid-template-columns:1fr} }
+    .pane{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:12px;min-height:160px}
+    h3{margin:0 0 8px 0;font-size:14px;color:var(--muted);font-weight:600;letter-spacing:.02em}
+    /* Final transcript list is scrollable and autoscrolls on append */
+    #finalList{display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow:auto;padding-right:6px}
+    .sentence{background:#0f172a;border:1px solid #1f2937;border-radius:10px;padding:10px;line-height:1.5}
+    #interimText{opacity:.8;font-style:italic;min-height:1.5em}
+    .notice{font-size:12px;color:var(--muted);padding:0 12px 12px}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:12px}
+    .warn{color:#fbbf24}
+    .ok{color:#34d399}
+    .dot{display:inline-block;width:8px;height:8px;border-radius:999px;background:#ef4444;margin-left:6px;vertical-align:middle;opacity:.5}
+    .dot.on{opacity:1;box-shadow:0 0 0 2px rgba(239,68,68,.25)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <header>
+        <div>
+          <div class="title">English Speech-to-Text + Audio Recording</div>
+          <div class="status" id="status">Idle · Lang: <span class="pill">en-US</span> · Recording: <span id="recState" class="pill">Off</span><span id="recDot" class="dot"></span></div>
+        </div>
+        <div class="controls">
+          <button id="btnToggle">🎙️ Start</button>
+          <button id="btnClear" class="secondary">🧹 Clear</button>
+          <button id="btnCopy" class="secondary">📋 Copy</button>
+          <button id="btnDownloadTxt" class="secondary">⬇️ Transcript</button>
+          <button id="btnDownloadAud" class="secondary" disabled>🎧 Audio</button>
+        </div>
+      </header>
+      <main>
+        <section class="pane">
+          <h3>Transcript (English sentences)</h3>
+          <div id="finalList" aria-live="polite"></div>
+        </section>
+        <aside class="pane">
+          <h3>Live (interim)</h3>
+          <div id="interimText">—</div>
+          <div class="notice">
+            <div>English check: <span id="langCheck" class="ok">OK</span></div>
+            <div style="margin-top:6px">Mic permission: <span id="perm" class="pill">Unknown</span></div>
+            <div style="margin-top:6px">Recorder MIME: <span id="mime" class="pill">—</span></div>
+          </div>
+        </aside>
+      </main>
+    </div>
+    <p class="notice">
+      Use latest <strong>Chrome</strong>. Requires mic access. iOS is not supported for <code>SpeechRecognition</code>.
+    </p>
+  </div>
+
+  <script>
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    const statusEl   = document.getElementById('status');
+    const finalList  = document.getElementById('finalList');
+    const interimEl  = document.getElementById('interimText');
+    const btnToggle  = document.getElementById('btnToggle');
+    const btnClear   = document.getElementById('btnClear');
+    const btnCopy    = document.getElementById('btnCopy');
+    const btnDownTxt = document.getElementById('btnDownloadTxt');
+    const btnDownAud = document.getElementById('btnDownloadAud');
+    const langCheckEl= document.getElementById('langCheck');
+    const permEl     = document.getElementById('perm');
+    const mimeEl     = document.getElementById('mime');
+    const recStateEl = document.getElementById('recState');
+    const recDot     = document.getElementById('recDot');
+
+    if (!SR) {
+      alert('Your browser does not support Web Speech API SpeechRecognition. Please use Google Chrome.');
+      statusEl.textContent = 'Not supported in this browser';
+      btnToggle.disabled = true;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text + ' · Lang: en-US · Recording: ' + recStateEl.textContent;
+    }
+
+    // ===== English-only heuristic =====
+    function englishHeuristic(str) {
+      const allowed = /[A-Za-z0-9\s.,!?'"():;\-]/;
+      let total = 0, bad = 0;
+      for (const ch of str) {
+        if (/\s/.test(ch)) continue;
+        total++;
+        if (!allowed.test(ch)) bad++;
+      }
+      if (total === 0) return true;
+      return (bad / total) <= 0.10;
+    }
+
+    // ===== Auto punctuation: add a period if no sentence-ending punctuation =====
+    function ensurePeriod(s) {
+      const t = s.trim();
+      if (!t) return t;
+      // If already ends with ., !, ?, …, or closing quote after them → keep
+      if (/[.!?…]"?$/.test(t)) return t;
+      return t + '.';
+    }
+
+    // ===== Append a sentence block & autoscroll =====
+    function appendSentence(text) {
+      const div = document.createElement('div');
+      div.className = 'sentence';
+      div.textContent = text;
+      finalList.appendChild(div);
+      // Auto-scroll to bottom
+      finalList.scrollTop = finalList.scrollHeight;
+    }
+
+    // ===== Collect transcript as plain text =====
+    function collectTranscript() {
+      const lines = Array.from(finalList.querySelectorAll('.sentence')).map(n => n.textContent.trim());
+      return lines.join(' ');
+    }
+
+    // ===== Mic permission probe (optional UX) =====
+    async function probePermissionOnly() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+        permEl.textContent = 'Granted';
+      } catch {
+        permEl.textContent = 'Denied';
+      }
+    }
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      probePermissionOnly();
+    }
+
+    // ===== SpeechRecognition setup =====
+    let recognition = null;
+    let listening = false;
+    let autoRestart = true;
+
+    function setupRecognition() {
+      recognition = new SR();
+      recognition.lang = 'en-US';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => setStatus('Listening');
+      recognition.onaudiostart = () => setStatus('Listening (audio)');
+      recognition.onsoundstart = () => setStatus('Listening (sound detected)');
+      recognition.onsoundend = () => setStatus('Listening (sound ended)');
+      recognition.onaudioend = () => setStatus('Listening (audio end)');
+
+      recognition.onresult = (event) => {
+        let interim = '';
+        let finalChunk = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const res = event.results[i];
+          if (res.isFinal) {
+            finalChunk += res[0].transcript;
+          } else {
+            interim += res[0].transcript;
+          }
+        }
+        if (interim) {
+          interimEl.textContent = interim;
+          const ok = englishHeuristic(interim);
+          langCheckEl.textContent = ok ? 'OK' : 'Possibly not English';
+          langCheckEl.className = ok ? 'ok' : 'warn';
+        } else if (!interim && !finalChunk) {
+          interimEl.textContent = '—';
+        }
+        if (finalChunk) {
+          const chunk = finalChunk.trim();
+          const isEnglish = englishHeuristic(chunk);
+          if (isEnglish) {
+            const withPeriod = ensurePeriod(chunk);
+            appendSentence(withPeriod);
+            langCheckEl.textContent = 'OK';
+            langCheckEl.className = 'ok';
+          } else {
+            // ignore non-English finals
+            langCheckEl.textContent = 'Possibly not English';
+            langCheckEl.className = 'warn';
+          }
+          interimEl.textContent = '—';
+        }
+      };
+
+      recognition.onerror = (e) => {
+        console.warn('Recognition error:', e.error);
+        setStatus('Error: ' + e.error);
+        if (listening && autoRestart && (e.error === 'no-speech' || e.error === 'network' || e.error === 'audio-capture')) {
+          setTimeout(() => { try { recognition.start(); } catch (_) {} }, 800);
+        }
+      };
+
+      recognition.onend = () => {
+        setStatus('Idle');
+        if (listening && autoRestart) {
+          try { recognition.start(); } catch (_) {}
+        }
+      };
+    }
+
+    // ===== MediaRecorder (record mic while transcribing) =====
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let audioBlobUrl = null;
+    let currentMime = '';
+
+    function pickSupportedMime() {
+      // Prefer webm/opus in Chrome
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ];
+      for (const c of candidates) {
+        if (MediaRecorder.isTypeSupported(c)) return c;
+      }
+      return ''; // let browser choose
+    }
+
+    async function startRecording() {
+      if (!navigator.mediaDevices?.getUserMedia) return;
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = pickSupportedMime();
+      currentMime = mime || 'default';
+      mimeEl.textContent = mime || 'default';
+      mediaRecorder = new MediaRecorder(mediaStream, mime ? { mimeType: mime } : undefined);
+      audioChunks = [];
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.onstart = () => {
+        recStateEl.textContent = 'On';
+        recDot.classList.add('on');
+        setStatus('Listening');
+      };
+      mediaRecorder.onstop = () => {
+        recStateEl.textContent = 'Off';
+        recDot.classList.remove('on');
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        if (audioBlobUrl) URL.revokeObjectURL(audioBlobUrl);
+        audioBlobUrl = URL.createObjectURL(blob);
+        btnDownAud.disabled = false;
+        // stop tracks
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(t => t.stop());
+          mediaStream = null;
+        }
+      };
+      mediaRecorder.start(); // you can set timeslice if you want chunked delivery
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    }
+
+    // ===== Controls =====
+    function startAll() {
+      if (!recognition) setupRecognition();
+      try {
+        recognition.start();
+        listening = true;
+        btnToggle.textContent = '⏹️ Stop';
+      } catch (e) {
+        console.warn('recognition.start() failed', e);
+      }
+      // Start recorder
+      startRecording().catch(err => {
+        console.warn('Recorder start failed:', err);
+        recStateEl.textContent = 'Off';
+        recDot.classList.remove('on');
+      });
+    }
+
+    function stopAll() {
+      // stop SR
+      if (recognition) {
+        listening = false;
+        autoRestart = false;
+        recognition.stop();
+        setTimeout(() => { autoRestart = true; }, 400);
+      }
+      // stop recorder
+      stopRecording();
+      btnToggle.textContent = '🎙️ Start';
+      setStatus('Idle');
+    }
+
+    btnToggle.addEventListener('click', () => {
+      if (!listening) startAll(); else stopAll();
+    });
+
+    btnClear.addEventListener('click', () => {
+      finalList.innerHTML = '';
+      interimEl.textContent = '—';
+      langCheckEl.textContent = 'OK';
+      langCheckEl.className = 'ok';
+    });
+
+    btnCopy.addEventListener('click', async () => {
+      const text = collectTranscript();
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        btnCopy.textContent = '✅ Copied';
+        setTimeout(() => (btnCopy.textContent = '📋 Copy'), 900);
+      } catch {
+        alert('Copy failed. You can select and copy manually.');
+      }
+    });
+
+    btnDownTxt.addEventListener('click', () => {
+      const text = collectTranscript();
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+      a.href = url;
+      a.download = `transcript-${stamp}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      URL.revokeObjectURL(url);
+      a.remove();
+    });
+
+    btnDownAud.addEventListener('click', () => {
+      if (!audioBlobUrl) return;
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+      a.href = audioBlobUrl;
+      // Decide extension by MIME
+      const ext = (mediaRecorder && mediaRecorder.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
+      a.download = `recording-${stamp}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+  </script>
+</body>
+</html>
